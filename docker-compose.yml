@@ -12,7 +12,17 @@ services:
   sample-site:
     # 与 api 共用同一基础镜像，避免额外拉取镜像
     image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8080", "--directory", "/site"]
+    # 离线样本站：静态目录 + 站内/站外跳转样例（仅标准库）
+    # 站外跳转目标默认 offsite.invalid（不可达），确保离线环境不会真的请求到站外
+    command:
+      - python
+      - /site/server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --offsite-origin
+      - http://offsite.invalid
     volumes:
       - ./sample_site:/site:ro
     ports:

@@ -10,7 +10,9 @@ import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
+sys.path.insert(0, str(ROOT / "sample_site"))
 
+import server as sample_server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from main import app  # noqa: E402
 
@@ -23,7 +25,6 @@ def start_site_server() -> tuple[http.server.ThreadingHTTPServer, str]:
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
 
-
 def check(name: str, cond: bool, extra: str = ""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" — {extra}" if extra else ""))
     if not cond:
@@ -31,10 +32,22 @@ def check(name: str, cond: bool, extra: str = ""):
 
 
 def main():
+    # 目录站与站外样例站各起一个端点，用独立的请求日志验证站外零请求
     httpd, base = start_site_server()
+    catalog_log: list[tuple[str, str]] = []
+    offsite_log: list[tuple[str, str]] = []
+    offsite_srv, offsite_base = sample_server.build_offsite_server(request_log=offsite_log)
+    catalog_srv, redirect_base = sample_server.build_catalog_server(
+        request_log=catalog_log, offsite_origin=offsite_base
+    )
+    # 目录站端口确定后，回填站外站"跳回本站"的跳转目标
+    offsite_srv.RequestHandlerClass.keywords["redirects"] = sample_server.offsite_redirects(
+        redirect_base
+    )
     client = TestClient(app)
     catalog = f"{base}/index.html"
     print(f"样本站: {catalog}")
+    print(f"跳转样例目录站: {redirect_base}（站外站: {offsite_base}）")
 
     # 1) 正常求解：MF-50 需求 180 → 2 包 100 片装，¥450
     r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 180})
@@ -104,6 +117,85 @@ def main():
     d = r.json()
     check("目录不存在状态 catalog_unreachable", d["status"] == "catalog_unreachable")
 
+    # ===== 站点边界：离线跳转样例 =====
+    # 11) 匹配详情跳到站外：返回原链接 + 跳转目标地址，不给确定报价
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{redirect_base}/ghost-catalog.html", "model": "GHOST-7", "demand": 10},
+    )
+    d = r.json()
+    check("详情越界状态 scrape_failed", d["status"] == "scrape_failed")
+    check("无方案（站外伪造价不参与最低价）", d["solution"] is None)
+    check(
+        "详情越界只报原链接",
+        [u for u in d["failed_detail_pages"] if u.endswith("/offsite/ghost-7.html")],
+        str(d.get("failed_detail_pages")),
+    )
+    redirects = {x["detail_url"]: x["redirect_target"] for x in d.get("offsite_redirects", [])}
+    check(
+        "返回跳转目标地址",
+        redirects.get(f"{redirect_base}/offsite/ghost-7.html") == f"{offsite_base}/details/ghost-7.html",
+        str(d.get("offsite_redirects")),
+    )
+    check("站外站点零请求", offsite_log == [], str(offsite_log))
+
+    # 12) 先跳站外、再跳回本站：第一跳即拦截，站外仍零请求
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{redirect_base}/offsite-catalog-return.html", "model": "RETURN-7", "demand": 10},
+    )
+    d = r.json()
+    check("站外后跳回本站仍状态 scrape_failed", d["status"] == "scrape_failed")
+    check("无方案", d["solution"] is None)
+    redirects = {x["detail_url"]: x["redirect_target"] for x in d.get("offsite_redirects", [])}
+    check(
+        "中转越界返回原链接与站外目标",
+        redirects.get(f"{redirect_base}/offsite/ghost-7-return.html")
+        == f"{offsite_base}/details/ghost-7-return.html",
+        str(d.get("offsite_redirects")),
+    )
+    check("站外站点零请求（未被诱导跳回）", offsite_log == [], str(offsite_log))
+
+    # 13) 目录越界：目录的下一页跳站外 → 目录不可用，且站外零请求
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{redirect_base}/offsite-catalog.html", "model": "MF-50", "demand": 10},
+    )
+    d = r.json()
+    check("目录越界状态 catalog_unreachable", d["status"] == "catalog_unreachable")
+    check("无方案", d["solution"] is None)
+    check(
+        "目录越界返回跳转目标地址",
+        d.get("offsite_redirects")
+        and d["offsite_redirects"][0]["redirect_target"] == f"{offsite_base}/bounce-back.html",
+        str(d.get("offsite_redirects")),
+    )
+    check("站外站点仍零请求", offsite_log == [], str(offsite_log))
+
+    # 14) 同站跳转仍可用：REDIR-1 详情 302 到同站另一路径，正常报价
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{redirect_base}/page3.html", "model": "REDIR-1", "demand": 120},
+    )
+    d = r.json()
+    check("同站跳转状态 ok", d["status"] == "ok")
+    check("同站跳转后总价 ¥300.00", d["solution"]["total_price"] == "300.00")
+    check("详情来源为原链接", d["solution"]["items"][0]["detail_url"].endswith("/go/redir-1.html"))
+    check("站外站点零请求", offsite_log == [], str(offsite_log))
+
+    # 15) 同站跳转的目录页（下一页跳回本站）仍可翻页
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{redirect_base}/page2.html", "model": "MF-50", "demand": 180},
+    )
+    d = r.json()
+    check("同站分页跳转正常", d["status"] == "ok" and len(d["list_pages"]) >= 2, str(d["list_pages"]))
+
+    # 15) 正常报价仍可用（站点边界不影响原目录）
+    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 180})
+    d = r.json()
+    check("原目录仍正常报价", d["status"] == "ok" and d["solution"]["total_price"] == "450.00")
+
     # 10) 兜底扫描语义：列表文案不含型号时逐个核对详情页
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -145,6 +237,8 @@ def main():
         httpd2.shutdown()
 
     httpd.shutdown()
+    catalog_srv.shutdown()
+    offsite_srv.shutdown()
     print("\n全部端到端检查通过 ✓")
 
 

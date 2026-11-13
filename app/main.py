@@ -7,9 +7,9 @@ POST /api/v1/quote
 状态语义：
   ok                  找到确定的最优组合
   insufficient_stock  库存总量不足，不给出确定最低价
-  scrape_failed       匹配详情页抓取/解析失败，不给出确定最低价
+  scrape_failed       匹配详情页抓取/解析失败或跳转到站外，不给出确定最低价
   no_matching_products 目录中没有匹配型号的商品
-  catalog_unreachable 目录列表页抓取失败
+  catalog_unreachable 目录列表页抓取失败（含站外跳转被拦截）
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from optimizer import Offer, optimize
-from scraper import ScrapeError, crawl_catalog
+from scraper import OffSiteRedirect, OffSiteRedirectError, ScrapeError, crawl_catalog
 
 app = FastAPI(title="滤膜采购组合优化 API", version="1.0.0")
 
@@ -34,6 +34,14 @@ def fen_to_yuan(fen: int) -> str:
     return f"{sign}{fen // 100}.{fen % 100:02d}"
 
 
+def redirect_to_dict(redirect: OffSiteRedirect) -> dict:
+    """站外跳转记录：保留目录中的原链接与跳转目标地址，便于采购员核对。"""
+    return {
+        "detail_url": redirect.source_url,
+        "redirect_target": redirect.target_url,
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "up"}
@@ -43,6 +51,16 @@ def health():
 def quote(req: QuoteRequest):
     try:
         crawl = crawl_catalog(req.catalog_url, req.model)
+    except OffSiteRedirectError as exc:
+        return {
+            "status": "catalog_unreachable",
+            "message": f"目录列表页跳转到站外站点，已拦截，目录不可用："
+            f"{exc.source_url} -> {exc.target_url}",
+            "model": req.model,
+            "demand": req.demand,
+            "offsite_redirects": [redirect_to_dict(exc.redirect)],
+            "solution": None,
+        }
     except ScrapeError as exc:
         return {
             "status": "catalog_unreachable",
@@ -59,13 +77,17 @@ def quote(req: QuoteRequest):
         "matched_detail_pages": [o.detail_url for o in crawl.matched],
         "duplicate_detail_links_skipped": crawl.duplicate_details,
     }
+    if crawl.offsite_redirects:
+        base["offsite_redirects"] = [
+            redirect_to_dict(r) for r in crawl.offsite_redirects
+        ]
 
-    # 匹配详情抓取失败：不给出确定的最低价
+    # 匹配详情抓取失败或跳往站外：不给出确定的最低价
     if crawl.failed_details:
         return {
             **base,
             "status": "scrape_failed",
-            "message": "部分匹配详情页抓取或解析失败，无法给出确定的最低价",
+            "message": "部分匹配详情页抓取、解析失败或跳转到站外，无法给出确定的最低价",
             "failed_detail_pages": crawl.failed_details,
             "solution": None,
         }
@@ -78,7 +100,7 @@ def quote(req: QuoteRequest):
             "solution": None,
         }
         if crawl.unverified_failed:
-            resp["message"] += "（另有部分详情页无法抓取，未能核对）"
+            resp["message"] += "（另有部分详情页无法抓取或跳转到站外，未能核对）"
             resp["unverified_failed_pages"] = crawl.unverified_failed
         return resp
 
@@ -87,7 +109,7 @@ def quote(req: QuoteRequest):
         return {
             **base,
             "status": "scrape_failed",
-            "message": "部分详情页无法抓取、未能核对是否还有更优匹配，无法给出确定的最低价",
+            "message": "部分详情页无法抓取或跳转到站外、未能核对是否还有更优匹配，无法给出确定的最低价",
             "failed_detail_pages": crawl.unverified_failed,
             "solution": None,
         }

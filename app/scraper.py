@@ -6,6 +6,13 @@
 3. 按型号筛选匹配的详情页并抓取，解析每包片数、含税包价、可购包数；
 4. 匹配到的详情页抓取或解析失败时记录到 failed_details（调用方据此
    不给出确定最低价）。
+
+站点边界：
+  所有请求手动逐跳跟随跳转（allow_redirects=False）。每一跳在发出请求前
+  先核对目标 netloc 是否与目录同站；任何站外目标都立即拦截，绝不对其发出
+  请求——即使该站外页面之后会跳回本站。目录列表页越界抛 OffSiteRedirect
+  （调用方按"目录不可用"处理）；详情页越界只在 offsite_redirects 中记录
+  原链接与跳转目标，并计入 failed_details / unverified_failed。
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ import requests
 from bs4 import BeautifulSoup
 
 MAX_PAGES = 50          # 分页抓取上限，防止死循环或异常站点
+MAX_REDIRECTS = 10      # 单次抓取允许的同站跳转跳数
 REQUEST_TIMEOUT = 10    # 单次请求超时（秒）
 USER_AGENT = "membrane-procurement-bot/1.0"
 
@@ -33,6 +41,33 @@ NUM_RE = re.compile(r"([\d,]+(?:\.\d+)?)")
 
 class ScrapeError(Exception):
     """抓取或解析失败。"""
+
+
+@dataclass
+class OffSiteRedirect:
+    """一次被站点边界拦截的跳转：原链接与跳转目标地址。"""
+
+    source_url: str   # 发出跳转的页面 URL
+    target_url: str   # 跳转响应给出的站外目标地址
+
+
+class OffSiteRedirectError(ScrapeError):
+    """跳转目标为站外站点，已在发出请求前拦截。"""
+
+    def __init__(self, redirect: OffSiteRedirect):
+        super().__init__(
+            f"站外跳转已拦截 {redirect.source_url} -> {redirect.target_url}"
+        )
+        self.redirect = redirect
+
+    @property
+    def source_url(self) -> str:
+        return self.redirect.source_url
+
+    @property
+    def target_url(self) -> str:
+        return self.redirect.target_url
+
 
 
 @dataclass
@@ -54,6 +89,7 @@ class CrawlResult:
     failed_details: list[str]       # 匹配但抓取/解析失败的详情 URL
     duplicate_details: int          # 跨页重复出现被跳过的详情链接数
     unverified_failed: list[str]    # 兜底扫描时无法抓取、未能核对型号的详情 URL
+    offsite_redirects: list[OffSiteRedirect]  # 被拦截的站外跳转（原链接 + 目标地址）
 
 
 def normalize_model(text: str) -> str:
@@ -65,18 +101,75 @@ def _abs_url(href: str, base: str) -> str:
     return urldefrag(urljoin(base, href))[0]
 
 
-def _same_site(url: str, netloc: str) -> bool:
-    return urlparse(url).netloc == netloc
-
-
-def _get_soup(session: requests.Session, url: str) -> BeautifulSoup:
+def _netloc_key(url: str) -> str:
+    """站点边界比较用的 netloc：忽略大小写与默认端口（host 大小写不敏感）。"""
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise ScrapeError(f"页面抓取失败 {url}: {exc}") from exc
-    # 用原始字节交给 BeautifulSoup，按页面 <meta charset> 自动识别编码
-    return BeautifulSoup(resp.content, "html.parser")
+        port = parts.port
+    except ValueError:
+        return ""  # 非法端口一律视为越界（交由调用方拦截）
+    scheme = parts.scheme.lower()
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        return f"{host}:{port}"
+    return host
+
+
+def _same_site(url: str, netloc: str) -> bool:
+    return _netloc_key(url) == _netloc_key(f"//{netloc}")
+
+
+def _fetch_page(
+    session: requests.Session, url: str, netloc: str
+) -> tuple[BeautifulSoup, str]:
+    """抓取页面并逐跳核对站点边界；任何站外跳转在请求发出前即被拦截。
+
+    手动跟随跳转（allow_redirects=False）而非交给 requests 自动跟随，
+    这样每一跳都能在发出请求前先核对目标站点。站外目标一律不请求，
+    即使它之后会跳回本站。返回 (解析后的页面, 最终落点 URL)。
+    """
+    current = url
+    previous = url
+    for _ in range(MAX_REDIRECTS + 1):
+        if not _same_site(current, netloc):
+            raise OffSiteRedirectError(
+                OffSiteRedirect(source_url=previous, target_url=current)
+            )
+        previous = current
+        try:
+            resp = session.get(
+                current, timeout=REQUEST_TIMEOUT, allow_redirects=False
+            )
+        except requests.RequestException as exc:
+            raise ScrapeError(f"页面抓取失败 {current}: {exc}") from exc
+
+        if resp.is_redirect:
+            location = resp.headers.get("Location", "")
+            if not location.strip():
+                raise ScrapeError(f"页面跳转缺少 Location {current}")
+            current = _abs_url(location, current)
+            continue
+
+        if resp.status_code >= 400:
+            raise ScrapeError(
+                f"页面抓取失败 {current}: HTTP {resp.status_code}"
+            )
+        if 300 <= resp.status_code < 400:
+            # 缺少 Location 的 3xx（如 304）不能当作有效页面，避免误解析
+            raise ScrapeError(
+                f"页面返回无法跟随的跳转 {current}: HTTP {resp.status_code}"
+            )
+        # 用原始字节交给 BeautifulSoup，按页面 <meta charset> 自动识别编码
+        return BeautifulSoup(resp.content, "html.parser"), current
+
+    raise ScrapeError(f"页面跳转次数过多 {url}")
+
+
+def _get_soup(session: requests.Session, url: str, netloc: str) -> BeautifulSoup:
+    """只取页面内容（不关心同站跳转后的最终落点）。"""
+    return _fetch_page(session, url, netloc)[0]
 
 
 def _product_links(soup: BeautifulSoup):
@@ -194,13 +287,19 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     seen_pages: set[str] = set()
     while url and url not in seen_pages and len(list_pages) < MAX_PAGES:
         seen_pages.add(url)
-        soup = _get_soup(session, url)  # 列表页失败：整个目录不可用，直接抛错
-        list_pages.append(url)
+        # 列表页失败（含站外跳转）：整个目录不可用，直接抛错
+        soup, final_url = _fetch_page(session, url, netloc)
+        if final_url != url and final_url in seen_pages:
+            break  # 同站跳转落回已抓取页面，避免重复与死循环
+        seen_pages.add(final_url)
+        list_pages.append(final_url)
+        # 同站跳转后按最终落点解析相对链接
+        base_url = final_url
         for a in _product_links(soup):
             href = a.get("href")
             if not href:
                 continue
-            detail_url = _abs_url(href, url)
+            detail_url = _abs_url(href, base_url)
             if not _same_site(detail_url, netloc):
                 continue  # 只接受同站详情链接
             if detail_url in seen_details:
@@ -208,7 +307,7 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
                 continue
             seen_details.add(detail_url)
             entries.append((detail_url, a.get_text(" ", strip=True)))
-        url = _next_page_url(soup, url, netloc)
+        url = _next_page_url(soup, base_url, netloc)
 
     # 先用列表文案匹配型号；若一个都匹配不上，退回逐个抓取详情页核对型号
     matched_entries = [(u, t) for u, t in entries if target in normalize_model(t)]
@@ -218,10 +317,19 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     matched: list[OfferInfo] = []
     failed: list[str] = []
     unverified: list[str] = []
+    offsite: list[OffSiteRedirect] = []
     for detail_url, _text in candidates:
         try:
-            soup = _get_soup(session, detail_url)
+            soup = _get_soup(session, detail_url, netloc)
             offer = parse_detail_page(detail_url, soup)
+        except OffSiteRedirectError as exc:
+            # 详情跳向站外：绝不请求站外目标，不给报价，但保留原链接与目标地址
+            offsite.append(exc.redirect)
+            if fallback_scan:
+                unverified.append(detail_url)  # 未能核对型号
+            else:
+                failed.append(detail_url)      # 列表文案已确认匹配
+            continue
         except ScrapeError:
             if fallback_scan:
                 # 兜底扫描时无法确认该页是否匹配，单独记录为"未能核对"
@@ -240,4 +348,5 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
         failed_details=failed,
         duplicate_details=duplicates,
         unverified_failed=unverified,
+        offsite_redirects=offsite,
     )

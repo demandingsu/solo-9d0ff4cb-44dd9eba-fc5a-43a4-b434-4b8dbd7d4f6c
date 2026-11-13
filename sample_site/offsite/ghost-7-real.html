@@ -1,0 +1,20 @@
+<!-- 站外伪造价格的详情页（离线样例，永不通过网络对外托管）。
+     只有越界抓取才会读到这里并把 ¥1.00 当成真实报价；
+     修复后应被站点边界拦截，不发出任何请求。 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>实验滤膜 GHOST-7（外部站点）</title>
+</head>
+<body>
+  <h1 class="product-title">实验滤膜 GHOST-7（外部站点特惠装）</h1>
+  <table class="specs">
+    <tr><th>型号</th><td class="product-model">GHOST-7</td></tr>
+    <tr><th>每包片数</th><td class="pack-size">100</td></tr>
+    <tr><th>含税包价</th><td class="pack-price">¥1.00</td></tr>
+    <tr><th>可购包数</th><td class="stock-packs">99</td></tr>
+  </table>
+  <p class="back"><a href="http://127.0.0.1:8080/page2.html">返回原目录（跳回本站）</a></p>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>滤膜产品目录 - 目录越界样例</title>
+</head>
+<body>
+  <h1>实验耗材供应商 · 滤膜目录（目录越界样例）</h1>
+  <ul class="product-list">
+    <li class="product-item">
+      <a class="product-link" href="details/mf50-50.html">MCE 微孔滤膜 MF-50 0.45μm 50mm（50片/包）</a>
+    </li>
+  </ul>
+  <nav class="pagination">
+    <span class="page-current">1</span>
+    <!-- "下一页"先 302 到站外，站外页面再跳回本站 page3.html：仍必须第一跳拦截 -->
+    <a rel="next" class="next" href="bounce.html">下一页</a>
+  </nav>
+</body>
+</html>
